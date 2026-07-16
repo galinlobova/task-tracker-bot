@@ -166,6 +166,10 @@ async function handleCallback(env, cq) {
 // ---------- Текстовые команды ----------
 
 async function handleCommand(env, chatId, text) {
+  // Команды из меню и в группах приходят как "/list@ИмяБота" — отрезаем @имя
+  if (text.startsWith('/')) {
+    text = text.replace(/^(\/[a-zA-Z_]+)@\S+/, '$1');
+  }
   const key = `tasks:${chatId}`;
   const secKey = `sections:${chatId}`;
   const tasks = JSON.parse((await env.TASKS.get(key)) || '[]');
