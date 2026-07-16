@@ -1,13 +1,13 @@
 /**
  * Telegram Task Tracker Bot — Cloudflare Worker
- * Хранение: KV (binding TASKS). Секреты: BOT_TOKEN, SECRET.
+ * KV binding: TASKS. Секреты: BOT_TOKEN, SECRET.
  *
- * Возможности:
- *  - разделы задач (Раздел: текст задачи, /newsec, /secs, /mv)
- *  - дедлайны (/due N дата [время]) и их изменение той же командой
- *  - напоминания за 1 нед / 1 день / 1 час / 15 мин (кнопки, /remind N)
- *  - список с кнопками ✅ / 🗑 / ↩️ (/list)
- *  - рассылка всех задач каждый будний день в 8:00 МСК (cron)
+ *  - разделы; /list присылает отдельное сообщение на каждый раздел,
+ *    кнопки задач — сразу под своим разделом
+ *  - диалоговые команды: /newsec, /due, /mv, /remind, /done, /del, /undo
+ *    без параметров дозапрашивают нужную информацию
+ *  - дедлайны, напоминания (1 нед/1 день/1 час/15 мин)
+ *  - рассылка по будням в 8:00 МСК (cron каждые 15 минут)
  */
 
 const REMINDER_OPTIONS = [
@@ -16,11 +16,13 @@ const REMINDER_OPTIONS = [
   { min: 60,    label: '1 час' },
   { min: 15,    label: '15 минут' },
 ];
-const MSK_MS = 3 * 60 * 60 * 1000; // UTC+3
+const MSK_MS = 3 * 60 * 60 * 1000;
 const DEFAULT_SECTION = 'Общее';
+const DATE_HINT =
+  'Формат даты: <code>ДД.ММ</code> или <code>ДД.ММ.ГГГГ</code>, время опционально.\n' +
+  'Примеры:\n<code>25.07</code>\n<code>25.07 15:00</code>\n<code>сегодня 18:00</code>\n<code>завтра</code>';
 
 export default {
-  // ---------- Webhook от Telegram ----------
   async fetch(request, env) {
     if (request.method !== 'POST') return new Response('OK');
     const url = new URL(request.url);
@@ -35,8 +37,7 @@ export default {
       } else if (update.message && update.message.text) {
         const chatId = update.message.chat.id;
         await registerChat(env, chatId);
-        const reply = await handleCommand(env, chatId, update.message.text.trim());
-        if (reply) await sendMessage(env, chatId, reply.text, reply.keyboard);
+        await handleMessage(env, chatId, update.message.text.trim());
       }
     } catch (e) {
       const chatId = update.message?.chat?.id || update.callback_query?.message?.chat?.id;
@@ -45,29 +46,23 @@ export default {
     return new Response('OK');
   },
 
-  // ---------- Cron: напоминания + утренняя рассылка ----------
   async scheduled(controller, env) {
     const now = controller.scheduledTime;
     const chats = JSON.parse((await env.TASKS.get('chats')) || '[]');
-
     const msk = new Date(now + MSK_MS);
     const isDigestTime = msk.getUTCHours() === 8 && msk.getUTCMinutes() < 15;
     const isWeekday = msk.getUTCDay() >= 1 && msk.getUTCDay() <= 5;
 
     for (const chatId of chats) {
-      const key = `tasks:${chatId}`;
-      const tasks = JSON.parse((await env.TASKS.get(key)) || '[]');
+      const tasks = await getTasks(env, chatId);
       let changed = false;
 
-      // Напоминания
       for (const t of tasks) {
         if (t.done || !t.deadline || !t.reminders?.length) continue;
         for (const offMin of t.reminders) {
           const fireAt = t.deadline - offMin * 60000;
-          const already = (t.sent || []).includes(offMin);
-          if (!already && now >= fireAt && now < t.deadline) {
-            t.sent = t.sent || [];
-            t.sent.push(offMin);
+          if (!(t.sent || []).includes(offMin) && now >= fireAt && now < t.deadline) {
+            (t.sent = t.sent || []).push(offMin);
             changed = true;
             const opt = REMINDER_OPTIONS.find((o) => o.min === offMin);
             await sendMessage(env, chatId,
@@ -76,16 +71,25 @@ export default {
           }
         }
       }
-      if (changed) await env.TASKS.put(key, JSON.stringify(tasks));
+      if (changed) await putTasks(env, chatId, tasks);
 
-      // Утренний дайджест по будням в 8:00 МСК
       if (isDigestTime && isWeekday && tasks.some((t) => !t.done)) {
-        const view = renderList(tasks, '🌅 <b>Задачи на сегодня</b>');
-        await sendMessage(env, chatId, view.text, view.keyboard);
+        const sections = await getSections(env, chatId);
+        await sendList(env, chatId, tasks, sections, '🌅 <b>Задачи на сегодня</b>');
       }
     }
   },
 };
+
+// ================= Хранилище =================
+
+const getTasks = async (env, id) => JSON.parse((await env.TASKS.get(`tasks:${id}`)) || '[]');
+const putTasks = (env, id, t) => env.TASKS.put(`tasks:${id}`, JSON.stringify(t));
+const getSections = async (env, id) => JSON.parse((await env.TASKS.get(`sections:${id}`)) || JSON.stringify([DEFAULT_SECTION]));
+const putSections = (env, id, s) => env.TASKS.put(`sections:${id}`, JSON.stringify(s));
+const getPending = async (env, id) => JSON.parse((await env.TASKS.get(`pending:${id}`)) || 'null');
+const setPending = (env, id, p) => env.TASKS.put(`pending:${id}`, JSON.stringify(p), { expirationTtl: 3600 });
+const clearPending = (env, id) => env.TASKS.delete(`pending:${id}`);
 
 async function registerChat(env, chatId) {
   const chats = JSON.parse((await env.TASKS.get('chats')) || '[]');
@@ -95,196 +99,383 @@ async function registerChat(env, chatId) {
   }
 }
 
-// ---------- Инлайн-кнопки ----------
+// ================= Сообщения =================
 
-async function handleCallback(env, cq) {
-  const chatId = cq.message.chat.id;
-  const messageId = cq.message.message_id;
-  const key = `tasks:${chatId}`;
-  const tasks = JSON.parse((await env.TASKS.get(key)) || '[]');
-  const parts = cq.data.split(':');
-  const action = parts[0];
-  let notice = '';
+async function handleMessage(env, chatId, raw) {
+  let text = raw;
+  if (text.startsWith('/')) text = text.replace(/^(\/[a-zA-Z_]+)@\S+/, '$1');
 
-  const byId = (id) => tasks.findIndex((t) => String(t.id) === id);
-
-  if (['done', 'undo', 'del'].includes(action)) {
-    const i = byId(parts[1]);
-    if (i === -1) notice = 'Задача не найдена';
-    else if (action === 'done') { tasks[i].done = true; notice = '✅ Выполнено'; }
-    else if (action === 'undo') { tasks[i].done = false; notice = '↩️ В работе'; }
-    else { tasks.splice(i, 1); notice = '🗑 Удалено'; }
-    await env.TASKS.put(key, JSON.stringify(tasks));
-    await tg(env, 'answerCallbackQuery', { callback_query_id: cq.id, text: notice });
-    const view = renderList(tasks);
-    await editMessage(env, chatId, messageId, view);
-    return;
-  }
-
-  if (action === 'clear') {
-    const remaining = tasks.filter((t) => !t.done);
-    notice = `🧹 Удалено: ${tasks.length - remaining.length}`;
-    await env.TASKS.put(key, JSON.stringify(remaining));
-    await tg(env, 'answerCallbackQuery', { callback_query_id: cq.id, text: notice });
-    await editMessage(env, chatId, messageId, renderList(remaining));
-    return;
-  }
-
-  // Переключение напоминаний: rem:<id>:<min>, завершение: remok:<id>
-  if (action === 'rem') {
-    const i = byId(parts[1]);
-    if (i !== -1) {
-      const min = parseInt(parts[2], 10);
-      const t = tasks[i];
-      t.reminders = t.reminders || [];
-      if (t.reminders.includes(min)) {
-        t.reminders = t.reminders.filter((m) => m !== min);
-        t.sent = (t.sent || []).filter((m) => m !== min);
-      } else {
-        t.reminders.push(min);
-      }
-      await env.TASKS.put(key, JSON.stringify(tasks));
-      await tg(env, 'answerCallbackQuery', { callback_query_id: cq.id });
-      await editMessage(env, chatId, messageId, reminderMenu(t));
-    }
-    return;
-  }
-
-  if (action === 'remok') {
-    const i = byId(parts[1]);
-    await tg(env, 'answerCallbackQuery', { callback_query_id: cq.id, text: 'Сохранено' });
-    if (i !== -1) {
-      const t = tasks[i];
-      const labels = REMINDER_OPTIONS.filter((o) => (t.reminders || []).includes(o.min)).map((o) => 'за ' + o.label);
-      await editMessage(env, chatId, messageId, {
-        text: `🔔 ${escapeHtml(t.text)}\n📅 ${fmtDeadline(t.deadline)}\nНапоминания: ${labels.length ? labels.join(', ') : 'нет'}`,
-      });
-    }
-  }
-}
-
-// ---------- Текстовые команды ----------
-
-async function handleCommand(env, chatId, text) {
-  // Команды из меню и в группах приходят как "/list@ИмяБота" — отрезаем @имя
-  if (text.startsWith('/')) {
-    text = text.replace(/^(\/[a-zA-Z_]+)@\S+/, '$1');
-  }
-  const key = `tasks:${chatId}`;
-  const secKey = `sections:${chatId}`;
-  const tasks = JSON.parse((await env.TASKS.get(key)) || '[]');
-  const sections = JSON.parse((await env.TASKS.get(secKey)) || JSON.stringify([DEFAULT_SECTION]));
-  const save = () => env.TASKS.put(key, JSON.stringify(tasks));
-  const saveSec = () => env.TASKS.put(secKey, JSON.stringify(sections));
-
-  if (text === '/start' || text === '/help') {
-    return { text: [
-      '📋 <b>Трекер задач</b>',
-      '',
-      '<b>Добавить задачу:</b> просто напиши текст.',
-      ' подготовить слайды</code>',
-      '',
-      '<b>Разделы:</b>',
-
-  
-      '/list — все задачи (кнопки: ✅ выполнить, 🗑 удалить)',
-
-      '🌅 Каждый будний день в 8:00 МСК пришлю весь список,',
-      '🔴 задачи с дедлайном сегодня будут выделены.',
-    ].join('\n') };
-  }
-
-  if (text === '/list' || text === '/l') return renderList(tasks);
-
-  if (text === '/secs') {
-    return { text: '📂 Разделы:\n' + sections.map((s, i) => `${i + 1}. ${escapeHtml(s)}`).join('\n') };
-  }
-
-  let m = text.match(/^\/newsec\s+(.+)$/);
-  if (m) {
-    const name = m[1].trim();
-    if (sections.some((s) => s.toLowerCase() === name.toLowerCase())) return { text: 'Такой раздел уже есть.' };
-    sections.push(name);
-    await saveSec();
-    return { text: `📂 Раздел «${escapeHtml(name)}» создан. Добавляй задачи так:\n<code>${escapeHtml(name)}: текст задачи</code>` };
-  }
-
-  m = text.match(/^\/mv\s+(\d+)\s+(.+)$/);
-  if (m) {
-    const t = tasks[parseInt(m[1], 10) - 1];
-    if (!t) return { text: `Задачи №${m[1]} нет.` };
-    const sec = sections.find((s) => s.toLowerCase() === m[2].trim().toLowerCase());
-    if (!sec) return { text: `Раздела «${escapeHtml(m[2])}» нет. Создай: /newsec ${escapeHtml(m[2])}` };
-    t.section = sec;
-    await save();
-    return renderList(tasks);
-  }
-
-  // /due N дата [время] — задать или изменить срок
-  m = text.match(/^\/due\s+(\d+)\s+(.+)$/);
-  if (m) {
-    const t = tasks[parseInt(m[1], 10) - 1];
-    if (!t) return { text: `Задачи №${m[1]} нет.` };
-    const dl = parseDeadline(m[2].trim());
-    if (!dl) return { text: 'Не поняла дату. Примеры:\n/due 3 25.07\n/due 3 25.07 15:00\n/due 3 завтра 18:00\n/due 3 сегодня' };
-    t.deadline = dl;
-    t.sent = []; // срок изменился — напоминания сработают заново
-    await save();
-    return reminderMenu(t, `📅 Срок задачи «${escapeHtml(t.text)}» — ${fmtDeadline(dl)}.\nЗа сколько напомнить?`);
-  }
-
-  m = text.match(/^\/remind\s+(\d+)$/);
-  if (m) {
-    const t = tasks[parseInt(m[1], 10) - 1];
-    if (!t) return { text: `Задачи №${m[1]} нет.` };
-    if (!t.deadline) return { text: 'Сначала задай срок: /due ' + m[1] + ' 25.07 15:00' };
-    return reminderMenu(t);
-  }
-
-  m = text.match(/^\/(?:done|d)\s+(\d+)$/);
-  if (m) { const t = tasks[parseInt(m[1],10)-1]; if (!t) return { text: `Задачи №${m[1]} нет.` }; t.done = true; await save(); return renderList(tasks); }
-  m = text.match(/^\/undo\s+(\d+)$/);
-  if (m) { const t = tasks[parseInt(m[1],10)-1]; if (!t) return { text: `Задачи №${m[1]} нет.` }; t.done = false; await save(); return renderList(tasks); }
-  m = text.match(/^\/del\s+(\d+)$/);
-  if (m) { const i = parseInt(m[1],10)-1; if (!tasks[i]) return { text: `Задачи №${m[1]} нет.` }; tasks.splice(i,1); await save(); return renderList(tasks); }
-  if (text === '/clear') {
-    const remaining = tasks.filter((t) => !t.done);
-    tasks.length = 0; tasks.push(...remaining);
-    await save();
-    return renderList(tasks);
-  }
+  const tasks = await getTasks(env, chatId);
+  const sections = await getSections(env, chatId);
 
   if (text.startsWith('/')) {
-    const hints = {
-      '/newsec': 'Эта команда с параметром — допиши название раздела:\n<code>/newsec Работа</code>',
-      '/mv': 'Допиши номер задачи и раздел:\n<code>/mv 2 Работа</code>',
-      '/due': 'Допиши номер задачи и дату:\n<code>/due 2 25.07 15:00</code>\n<code>/due 2 завтра</code>',
-      '/remind': 'Допиши номер задачи:\n<code>/remind 2</code>',
-      '/done': 'Допиши номер задачи: <code>/done 2</code>\nИли отметь кнопкой ✅ в списке /list',
-      '/undo': 'Допиши номер задачи: <code>/undo 2</code>',
-      '/del': 'Допиши номер задачи: <code>/del 2</code>\nИли удали кнопкой 🗑 в списке /list',
-    };
-    if (hints[text]) return { text: hints[text] };
-    return { text: 'Не знаю такую команду. Напиши /help.' };
+    await clearPending(env, chatId); // новая команда отменяет начатый диалог
+    return handleSlash(env, chatId, text, tasks, sections);
   }
 
-  // Добавление задачи, опционально с разделом: "Раздел: текст"
+  const pending = await getPending(env, chatId);
+  if (pending) return handlePendingInput(env, chatId, text, pending, tasks, sections);
+
+  // Обычный текст — новая задача ("Раздел: текст" кладёт в раздел)
   let section = DEFAULT_SECTION;
   let taskText = text;
   const colon = text.indexOf(':');
   if (colon > 0) {
-    const maybeSec = text.slice(0, colon).trim();
-    const found = sections.find((s) => s.toLowerCase() === maybeSec.toLowerCase());
+    const found = sections.find((s) => s.toLowerCase() === text.slice(0, colon).trim().toLowerCase());
     if (found) { section = found; taskText = text.slice(colon + 1).trim(); }
   }
-  if (!taskText) return { text: 'Пустая задача 🙂' };
+  if (!taskText) return sendMessage(env, chatId, 'Пустая задача 🙂');
   tasks.push({ id: Date.now(), text: taskText, done: false, section });
-  await save();
+  await putTasks(env, chatId, tasks);
   const n = tasks.length;
-  return { text: `➕ Добавлено в «${escapeHtml(section)}» (№${n}): ${escapeHtml(taskText)}\nСрок: <code>/due ${n} 25.07 15:00</code>` };
+  await sendMessage(env, chatId,
+    `➕ Добавлено в «${escapeHtml(section)}» (№${n}): ${escapeHtml(taskText)}\n` +
+    `Задать срок: /due · Перенести в раздел: /mv`);
 }
 
-// ---------- Меню выбора напоминаний ----------
+// ================= Команды =================
+
+async function handleSlash(env, chatId, text, tasks, sections) {
+  const taskByNum = (numStr) => tasks[parseInt(numStr, 10) - 1];
+
+  if (text === '/start' || text === '/help') {
+    return sendMessage(env, chatId, [
+      '📋 <b>Трекер задач</b>',
+      '',
+      '<b>Добавить задачу:</b> просто напиши текст.',
+      'Сразу в раздел: <code>Работа: подготовить слайды</code>',
+      '',
+      '<b>Команды</b> (можно без параметров — я всё спрошу):',
+      '/list — список задач по разделам',
+      '/newsec — создать раздел, /secs — все разделы',
+      '/mv — перенести задачу в раздел',
+      '/due — задать или изменить срок',
+      '/remind — настроить напоминания (1 нед / 1 день / 1 час / 15 мин)',
+      '/done, /undo, /del — выполнить / вернуть / удалить',
+      '/clear — убрать все выполненные',
+      '',
+      '🌅 По будням в 8:00 МСК пришлю весь список,',
+      '🔴 задачи с дедлайном сегодня будут выделены.',
+    ].join('\n'));
+  }
+
+  if (text === '/list' || text === '/l') {
+    return sendList(env, chatId, tasks, sections);
+  }
+
+  if (text === '/secs') {
+    const counts = sections.map((s) => {
+      const n = tasks.filter((t) => !t.done && (t.section || DEFAULT_SECTION) === s).length;
+      return `📂 ${escapeHtml(s)} — в работе: ${n}`;
+    });
+    return sendMessage(env, chatId, '<b>Разделы:</b>\n' + counts.join('\n') + '\n\nНовый раздел: /newsec');
+  }
+
+  // ---- /newsec ----
+  let m = text.match(/^\/newsec(?:\s+(.+))?$/);
+  if (m) {
+    if (!m[1]) {
+      await setPending(env, chatId, { action: 'newsec' });
+      return sendMessage(env, chatId, '📂 Введи название нового раздела:');
+    }
+    return createSection(env, chatId, m[1].trim(), sections);
+  }
+
+  // ---- /mv ----
+  m = text.match(/^\/mv(?:\s+(\d+))?(?:\s+(.+))?$/);
+  if (m) {
+    if (!m[1]) {
+      await setPending(env, chatId, { action: 'mv_num' });
+      return sendMessage(env, chatId, '↔️ Какую задачу перенести? Напиши её номер (номера видны в /list):');
+    }
+    const t = taskByNum(m[1]);
+    if (!t) return sendMessage(env, chatId, `Задачи №${m[1]} нет. Посмотри номера: /list`);
+    if (!m[2]) return askSection(env, chatId, t, sections);
+    const sec = sections.find((s) => s.toLowerCase() === m[2].trim().toLowerCase());
+    if (!sec) return sendMessage(env, chatId, `Раздела «${escapeHtml(m[2])}» нет. Создай его: /newsec`);
+    t.section = sec;
+    await putTasks(env, chatId, tasks);
+    return sendMessage(env, chatId, `↔️ «${escapeHtml(t.text)}» → 📂 ${escapeHtml(sec)}`);
+  }
+
+  // ---- /due ----
+  m = text.match(/^\/due(?:\s+(\d+))?(?:\s+(.+))?$/);
+  if (m) {
+    if (!m[1]) {
+      await setPending(env, chatId, { action: 'due_num' });
+      return sendMessage(env, chatId, '📅 Какой задаче задать срок? Напиши её номер:');
+    }
+    const t = taskByNum(m[1]);
+    if (!t) return sendMessage(env, chatId, `Задачи №${m[1]} нет. Посмотри номера: /list`);
+    if (!m[2]) {
+      await setPending(env, chatId, { action: 'due_date', taskId: t.id });
+      return sendMessage(env, chatId, `📅 Когда дедлайн у «${escapeHtml(t.text)}»?\n\n${DATE_HINT}`);
+    }
+    return applyDeadline(env, chatId, tasks, t, m[2].trim());
+  }
+
+  // ---- /remind ----
+  m = text.match(/^\/remind(?:\s+(\d+))?$/);
+  if (m) {
+    if (!m[1]) {
+      await setPending(env, chatId, { action: 'remind_num' });
+      return sendMessage(env, chatId, '🔔 Для какой задачи настроить напоминания? Напиши номер:');
+    }
+    const t = taskByNum(m[1]);
+    if (!t) return sendMessage(env, chatId, `Задачи №${m[1]} нет.`);
+    if (!t.deadline) {
+      await setPending(env, chatId, { action: 'due_date', taskId: t.id });
+      return sendMessage(env, chatId, `У задачи нет срока — сначала зададим его.\n📅 Когда дедлайн?\n\n${DATE_HINT}`);
+    }
+    const menu = reminderMenu(t);
+    return sendMessage(env, chatId, menu.text, menu.keyboard);
+  }
+
+  // ---- /done /undo /del ----
+  m = text.match(/^\/(done|d|undo|del)(?:\s+(\d+))?$/);
+  if (m) {
+    const action = m[1] === 'd' ? 'done' : m[1];
+    if (!m[2]) {
+      await setPending(env, chatId, { action: action + '_num' });
+      const verbs = { done: 'отметить выполненной', undo: 'вернуть в работу', del: 'удалить' };
+      return sendMessage(env, chatId, `Какую задачу ${verbs[action]}? Напиши номер:`);
+    }
+    return applySimple(env, chatId, tasks, action, m[2]);
+  }
+
+  if (text === '/clear') {
+    const remaining = tasks.filter((t) => !t.done);
+    const removed = tasks.length - remaining.length;
+    await putTasks(env, chatId, remaining);
+    return sendMessage(env, chatId, `🧹 Удалено выполненных: ${removed}. Актуальный список: /list`);
+  }
+
+  return sendMessage(env, chatId, 'Не знаю такую команду. Напиши /help.');
+}
+
+// ================= Диалоговые ответы =================
+
+async function handlePendingInput(env, chatId, text, pending, tasks, sections) {
+  const needNum = () => {
+    const m = text.match(/^\d+$/);
+    if (!m) { sendMessage(env, chatId, 'Напиши просто номер задачи, например: 2\n(номера видны в /list)'); return null; }
+    const t = tasks[parseInt(text, 10) - 1];
+    if (!t) { sendMessage(env, chatId, `Задачи №${text} нет. Посмотри номера: /list`); return null; }
+    return t;
+  };
+
+  switch (pending.action) {
+    case 'newsec':
+      await clearPending(env, chatId);
+      return createSection(env, chatId, text, sections);
+
+    case 'mv_num': {
+      const t = needNum(); if (!t) return;
+      await clearPending(env, chatId);
+      return askSection(env, chatId, t, sections);
+    }
+
+    case 'due_num': {
+      const t = needNum(); if (!t) return;
+      await setPending(env, chatId, { action: 'due_date', taskId: t.id });
+      return sendMessage(env, chatId, `📅 Когда дедлайн у «${escapeHtml(t.text)}»?\n\n${DATE_HINT}`);
+    }
+
+    case 'due_date': {
+      const t = tasks.find((x) => x.id === pending.taskId);
+      if (!t) { await clearPending(env, chatId); return sendMessage(env, chatId, 'Задача не найдена — возможно, удалена.'); }
+      const dl = parseDeadline(text);
+      if (!dl) {
+        // остаёмся в диалоге и подсказываем формат
+        return sendMessage(env, chatId, `Не поняла дату 🤔\n\n${DATE_HINT}\n\nПопробуй ещё раз:`);
+      }
+      await clearPending(env, chatId);
+      return applyDeadline(env, chatId, tasks, t, text, dl);
+    }
+
+    case 'remind_num': {
+      const t = needNum(); if (!t) return;
+      await clearPending(env, chatId);
+      if (!t.deadline) {
+        await setPending(env, chatId, { action: 'due_date', taskId: t.id });
+        return sendMessage(env, chatId, `У задачи нет срока — сначала зададим его.\n📅 Когда дедлайн?\n\n${DATE_HINT}`);
+      }
+      const menu = reminderMenu(t);
+      return sendMessage(env, chatId, menu.text, menu.keyboard);
+    }
+
+    case 'done_num': case 'undo_num': case 'del_num': {
+      const t = needNum(); if (!t) return;
+      await clearPending(env, chatId);
+      return applySimple(env, chatId, tasks, pending.action.replace('_num', ''), text);
+    }
+  }
+  await clearPending(env, chatId);
+}
+
+// ================= Действия =================
+
+async function createSection(env, chatId, name, sections) {
+  name = name.replace(/:/g, '').trim();
+  if (!name) return sendMessage(env, chatId, 'Название не может быть пустым. Попробуй ещё раз: /newsec');
+  if (sections.some((s) => s.toLowerCase() === name.toLowerCase())) {
+    return sendMessage(env, chatId, `Раздел «${escapeHtml(name)}» уже есть.`);
+  }
+  sections.push(name);
+  await putSections(env, chatId, sections);
+  return sendMessage(env, chatId,
+    `📂 Раздел «${escapeHtml(name)}» создан.\nДобавляй в него задачи так:\n<code>${escapeHtml(name)}: текст задачи</code>`);
+}
+
+function askSection(env, chatId, task, sections) {
+  const rows = sections.map((s, i) => [{ text: '📂 ' + s, callback_data: `mvsec:${task.id}:${i}` }]);
+  return sendMessage(env, chatId, `↔️ В какой раздел перенести «${escapeHtml(task.text)}»?`, rows);
+}
+
+async function applyDeadline(env, chatId, tasks, t, dateStr, parsed) {
+  const dl = parsed !== undefined ? parsed : parseDeadline(dateStr);
+  if (!dl) return sendMessage(env, chatId, `Не поняла дату 🤔\n\n${DATE_HINT}\n\nПовтори команду: /due`);
+  t.deadline = dl;
+  t.sent = [];
+  await putTasks(env, chatId, tasks);
+  const menu = reminderMenu(t, `📅 Срок «${escapeHtml(t.text)}» — <b>${fmtDeadline(dl)}</b>.\nЗа сколько напомнить? (можно несколько)`);
+  return sendMessage(env, chatId, menu.text, menu.keyboard);
+}
+
+async function applySimple(env, chatId, tasks, action, numStr) {
+  const i = parseInt(numStr, 10) - 1;
+  const t = tasks[i];
+  if (!t) return sendMessage(env, chatId, `Задачи №${numStr} нет. Посмотри номера: /list`);
+  if (action === 'done') { t.done = true; await putTasks(env, chatId, tasks); return sendMessage(env, chatId, `✅ Выполнено: ${escapeHtml(t.text)}`); }
+  if (action === 'undo') { t.done = false; await putTasks(env, chatId, tasks); return sendMessage(env, chatId, `↩️ В работе: ${escapeHtml(t.text)}`); }
+  tasks.splice(i, 1);
+  await putTasks(env, chatId, tasks);
+  return sendMessage(env, chatId, `🗑 Удалено: ${escapeHtml(t.text)}`);
+}
+
+// ================= Инлайн-кнопки =================
+
+async function handleCallback(env, cq) {
+  const chatId = cq.message.chat.id;
+  const messageId = cq.message.message_id;
+  const tasks = await getTasks(env, chatId);
+  const sections = await getSections(env, chatId);
+  const parts = cq.data.split(':');
+  const action = parts[0];
+  const byId = (id) => tasks.findIndex((t) => String(t.id) === id);
+  const ack = (text) => tg(env, 'answerCallbackQuery', { callback_query_id: cq.id, text });
+
+  if (['done', 'undo', 'del'].includes(action)) {
+    const i = byId(parts[1]);
+    if (i === -1) return ack('Задача не найдена — обнови /list');
+    const section = tasks[i].section || DEFAULT_SECTION;
+    let notice;
+    if (action === 'done') { tasks[i].done = true; notice = '✅ Выполнено'; }
+    else if (action === 'undo') { tasks[i].done = false; notice = '↩️ В работе'; }
+    else { tasks.splice(i, 1); notice = '🗑 Удалено'; }
+    await putTasks(env, chatId, tasks);
+    await ack(notice);
+    const view = renderSection(tasks, section);
+    return editMessage(env, chatId, messageId,
+      view || { text: `📂 <b>${escapeHtml(section)}</b>\n— пусто` });
+  }
+
+  if (action === 'mvsec') {
+    const i = byId(parts[1]);
+    if (i === -1) return ack('Задача не найдена');
+    const sec = sections[parseInt(parts[2], 10)];
+    if (!sec) return ack('Раздел не найден');
+    tasks[i].section = sec;
+    await putTasks(env, chatId, tasks);
+    await ack('Перенесено');
+    return editMessage(env, chatId, messageId,
+      { text: `↔️ «${escapeHtml(tasks[i].text)}» → 📂 <b>${escapeHtml(sec)}</b>` });
+  }
+
+  if (action === 'rem') {
+    const i = byId(parts[1]);
+    if (i === -1) return ack('Задача не найдена');
+    const min = parseInt(parts[2], 10);
+    const t = tasks[i];
+    t.reminders = t.reminders || [];
+    if (t.reminders.includes(min)) {
+      t.reminders = t.reminders.filter((x) => x !== min);
+      t.sent = (t.sent || []).filter((x) => x !== min);
+    } else t.reminders.push(min);
+    await putTasks(env, chatId, tasks);
+    await ack('');
+    return editMessage(env, chatId, messageId, reminderMenu(t));
+  }
+
+  if (action === 'remok') {
+    const i = byId(parts[1]);
+    await ack('Сохранено');
+    if (i === -1) return;
+    const t = tasks[i];
+    const labels = REMINDER_OPTIONS.filter((o) => (t.reminders || []).includes(o.min)).map((o) => 'за ' + o.label);
+    return editMessage(env, chatId, messageId, {
+      text: `🔔 ${escapeHtml(t.text)}\n📅 ${fmtDeadline(t.deadline)}\nНапоминания: ${labels.length ? labels.join(', ') : 'нет'}`,
+    });
+  }
+}
+
+// ================= Отрисовка =================
+
+function renderSection(tasks, section) {
+  const items = [];
+  tasks.forEach((t, i) => {
+    if ((t.section || DEFAULT_SECTION) === section) items.push({ t, num: i + 1 });
+  });
+  if (!items.length) return null;
+
+  const todayMsk = mskDateStr(Date.now());
+  const lines = items.map(({ t, num }) => {
+    let dl = '';
+    if (t.deadline && !t.done) {
+      if (t.deadline < Date.now()) dl = `\n    ⚠️ <b>просрочено ${fmtDeadline(t.deadline)}</b>`;
+      else if (mskDateStr(t.deadline) === todayMsk) dl = `\n    🔴 <b>сегодня ${fmtTime(t.deadline)}</b>`;
+      else dl = `\n    📅 ${fmtDeadline(t.deadline)}`;
+    }
+    return t.done
+      ? `${num}. ✅ <s>${escapeHtml(t.text)}</s>`
+      : `${num}. ⬜ ${escapeHtml(t.text)}${dl}`;
+  });
+
+  const keyboard = items.map(({ t, num }) => {
+    const short = t.text.length > 18 ? t.text.slice(0, 18) + '…' : t.text;
+    return [
+      t.done
+        ? { text: `↩️ ${num}. ${short}`, callback_data: `undo:${t.id}` }
+        : { text: `✅ ${num}. ${short}`, callback_data: `done:${t.id}` },
+      { text: '🗑', callback_data: `del:${t.id}` },
+    ];
+  });
+
+  return { text: `📂 <b>${escapeHtml(section)}</b>\n\n` + lines.join('\n'), keyboard };
+}
+
+async function sendList(env, chatId, tasks, sections, title) {
+  if (tasks.length === 0) {
+    return sendMessage(env, chatId, '📭 Список пуст. Напиши текст задачи, чтобы добавить.');
+  }
+  const open = tasks.filter((t) => !t.done).length;
+  const hasDone = tasks.some((t) => t.done);
+
+  // Заголовок (+ кнопка очистки выполненных)
+  await sendMessage(env, chatId, `${title || '📋 <b>Задачи</b>'} — в работе: ${open}`,
+    hasDone ? [[{ text: '🧹 Убрать выполненные', callback_data: 'clear:0' }]] : undefined);
+
+  // Все разделы по порядку: из списка разделов + встретившиеся в задачах
+  const all = [...sections];
+  for (const t of tasks) {
+    const s = t.section || DEFAULT_SECTION;
+    if (!all.includes(s)) all.push(s);
+  }
+  for (const sec of all) {
+    const view = renderSection(tasks, sec);
+    if (view) await sendMessage(env, chatId, view.text, view.keyboard);
+  }
+}
 
 function reminderMenu(t, header) {
   const chosen = t.reminders || [];
@@ -299,68 +490,23 @@ function reminderMenu(t, header) {
   };
 }
 
-// ---------- Отрисовка списка ----------
-
-function renderList(tasks, title) {
-  if (tasks.length === 0) return { text: '📭 Список пуст. Напиши текст задачи, чтобы добавить.' };
-
-  const todayMsk = mskDateStr(Date.now());
-  const groups = {};
-  tasks.forEach((t, i) => {
-    const sec = t.section || DEFAULT_SECTION;
-    (groups[sec] = groups[sec] || []).push({ t, num: i + 1 });
-  });
-
-  const lines = [];
-  for (const sec of Object.keys(groups)) {
-    lines.push(`\n📂 <b>${escapeHtml(sec)}</b>`);
-    for (const { t, num } of groups[sec]) {
-      let dl = '';
-      if (t.deadline) {
-        const dStr = mskDateStr(t.deadline);
-        if (!t.done && t.deadline < Date.now()) dl = ` ⚠️ <b>просрочено ${fmtDeadline(t.deadline)}</b>`;
-        else if (!t.done && dStr === todayMsk) dl = ` 🔴 <b>сегодня ${fmtTime(t.deadline)}</b>`;
-        else dl = ` 📅 ${fmtDeadline(t.deadline)}`;
-      }
-      lines.push(t.done
-        ? `${num}. ✅ <s>${escapeHtml(t.text)}</s>`
-        : `${num}. ⬜ ${escapeHtml(t.text)}${dl}`);
-    }
-  }
-  const open = tasks.filter((t) => !t.done).length;
-
-  const keyboard = tasks.map((t, i) => {
-    const num = i + 1;
-    const short = t.text.length > 18 ? t.text.slice(0, 18) + '…' : t.text;
-    return [
-      t.done
-        ? { text: `↩️ ${num}. ${short}`, callback_data: `undo:${t.id}` }
-        : { text: `✅ ${num}. ${short}`, callback_data: `done:${t.id}` },
-      { text: '🗑', callback_data: `del:${t.id}` },
-    ];
-  });
-  if (tasks.some((t) => t.done)) keyboard.push([{ text: '🧹 Убрать выполненные', callback_data: 'clear:0' }]);
-
-  return { text: `${title || '📋 <b>Задачи</b>'} (в работе: ${open})` + lines.join('\n'), keyboard };
-}
-
-// ---------- Даты (МСК = UTC+3) ----------
+// ================= Даты (МСК = UTC+3) =================
 
 function parseDeadline(str) {
-  const m = str.toLowerCase().match(/^(сегодня|завтра|\d{1,2}\.\d{1,2}(?:\.\d{4})?)(?:\s+(\d{1,2}):(\d{2}))?$/);
+  const m = str.toLowerCase().trim().match(/^(сегодня|завтра|\d{1,2}\.\d{1,2}(?:\.\d{4})?)(?:\s+(\d{1,2}):(\d{2}))?$/);
   if (!m) return null;
   const nowMsk = new Date(Date.now() + MSK_MS);
   let y = nowMsk.getUTCFullYear(), mo = nowMsk.getUTCMonth(), d = nowMsk.getUTCDate();
-
   if (m[1] === 'завтра') d += 1;
   else if (m[1] !== 'сегодня') {
     const p = m[1].split('.');
     d = parseInt(p[0], 10);
     mo = parseInt(p[1], 10) - 1;
+    if (mo > 11 || d > 31) return null;
     if (p[2]) y = parseInt(p[2], 10);
-    else if (mo < nowMsk.getUTCMonth() || (mo === nowMsk.getUTCMonth() && d < nowMsk.getUTCDate())) y += 1; // дата уже прошла — значит, следующий год
+    else if (mo < nowMsk.getUTCMonth() || (mo === nowMsk.getUTCMonth() && d < nowMsk.getUTCDate())) y += 1;
   }
-  const hh = m[2] !== undefined ? parseInt(m[2], 10) : 10; // время по умолчанию 10:00 МСК
+  const hh = m[2] !== undefined ? parseInt(m[2], 10) : 10;
   const mm = m[3] !== undefined ? parseInt(m[3], 10) : 0;
   if (hh > 23 || mm > 59) return null;
   return Date.UTC(y, mo, d, hh, mm) - MSK_MS;
@@ -379,7 +525,7 @@ function fmtDeadline(ts) {
   return `${String(d.getUTCDate()).padStart(2, '0')}.${String(d.getUTCMonth() + 1).padStart(2, '0')} ${fmtTime(ts)}`;
 }
 
-// ---------- Утилиты ----------
+// ================= Утилиты =================
 
 function escapeHtml(s) {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
