@@ -1,0 +1,13 @@
+name = "task-tracker-bot"
+main = "worker.js"
+compatibility_date = "2026-07-01"
+
+# Привязка KV-хранилища.
+# ID возьми в Cloudflare: Workers & Pages → KV → namespace TASKS → скопировать ID
+[[kv_namespaces]]
+binding = "TASKS"
+id = "ВСТАВЬ_СЮДА_ID_NAMESPACE"
+
+# Секреты BOT_TOKEN и SECRET здесь НЕ указываются —
+# они остаются в настройках воркера (Settings → Variables and Secrets)
+# и сохраняются при каждом деплое.
