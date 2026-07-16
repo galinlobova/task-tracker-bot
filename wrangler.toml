@@ -6,7 +6,7 @@ compatibility_date = "2026-07-01"
 # ID возьми в Cloudflare: Workers & Pages → KV → namespace TASKS → скопировать ID
 [[kv_namespaces]]
 binding = "TASKS"
-id = "ВСТАВЬ_СЮДА_ID_NAMESPACE"
+id = "10b3c48fb57a48adbd3cbd1384e2680a"
 
 # Секреты BOT_TOKEN и SECRET здесь НЕ указываются —
 # они остаются в настройках воркера (Settings → Variables and Secrets)
